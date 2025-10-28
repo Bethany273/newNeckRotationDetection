@@ -7,7 +7,7 @@ import math
 # ---------- Parameters ----------
 # Expected distance ratio at ~90° yaw versus frontal.
 # Tune this empirically for your setup (0.3–0.5 is a common range).
-R_AT_90 = 0.54
+R_AT_90 = 0.55
 
 # Visibility threshold to accept a landmark
 VIS_THRESH = 0.5
