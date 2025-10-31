@@ -7,8 +7,7 @@ import math
 # ---------- Parameters ----------
 R_AT_90 = 0.6     # Expected proportion ratio at 90 deg yaw (for reference)
 VIS_THRESH = 0.5    # Visibility threshold for landmarks
-CALIB_SECONDS = 3.0 # Calibration duration in seconds
-GAMMA = 0.5         # (Unused now, kept if you want nonlinear scaling later)
+CALIB_SECONDS = 3.0 # Calibration duration in seconds        # (Unused now, kept if you want nonlinear scaling later)
 EPS = 1e-6
 
 # ---------- Globals ----------
@@ -22,6 +21,17 @@ calibration_complete = False
 baseline_nose_offset = 0.0
 calibration_nose_x = []
 baseline_nose_x = 0.0
+
+# ---------- Repetition & Max Rotation Logic ----------
+
+ANGLE_THRESHOLD = 30      # degrees to qualify as full turn
+NEUTRAL_THRESHOLD = 10    # degrees considered neutral range
+rep_count = 0
+direction = "neutral"   # can be 'neutral', 'left', or 'right'
+max_right = 0.0
+max_left = 0.0
+completed_sides = set()
+MESSAGE_DURATION = 2.0
 
 # ---------- Utility Functions ----------
 def clamp(x, lo, hi):
@@ -157,10 +167,11 @@ model_complexity=1) as pose:
                 if landmarks_ok:
                     delta_offset = nose_to_shoulder - baseline_nose_offset
 
-                    SCALE = 2.0
+                    SCALE = 1.5
                     GAMMA = 1.8
                     t = clamp(abs(delta_offset) * SCALE, 0.0, 1.0)
-                    t_mapped = t ** GAMMA
+                    t_mapped =1 - (1 - t)**GAMMA
+                    t_mapped = t_mapped ** 1.5
                     shoulder_angle = 90.0 * t_mapped
                     if delta_offset < 0:
                         shoulder_angle = -shoulder_angle
@@ -177,15 +188,72 @@ model_complexity=1) as pose:
 
                     cv2.putText(image, f"Head Rotation: {shoulder_angle:+.1f} deg",
                                 (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+                    
+                    # Initialize globals (only first run)
+                    if 'last_message' not in globals():
+                        last_message = ""
+                        message_time = 0.0
 
-                    # compute and show translation (head shift)
-                    head_shift_px = nose_px[0] - mid_shoulder_x
-                    delta_shift = head_shift_px - baseline_nose_x
-                    head_shift_ratio = delta_shift / (shoulder_dist + EPS)
-                    real_shift_cm = head_shift_ratio * 40.0
+                    current_time = time.time()
+                    
+                    # Record max angles reached
+                    if shoulder_angle > max_right:
+                        max_right = shoulder_angle
+                    if shoulder_angle < max_left:
+                        max_left = shoulder_angle
 
-                    cv2.putText(image, f"Head Shift: {real_shift_cm:+.1f} cm",
-                                (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2, cv2.LINE_AA)
+                    # State transitions
+                    if direction == "neutral":
+                        if shoulder_angle > ANGLE_THRESHOLD:
+                            direction = "right"
+                            completed_sides.add("right")
+                            cv2.putText(image, "Right rotation complete!", (30, 120),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                            last_message = "Right rotation complete!"
+                            message_time = current_time
+
+                        elif shoulder_angle < -ANGLE_THRESHOLD:
+                            direction = "left"
+                            completed_sides.add("left")
+                            cv2.putText(image, "Left rotation complete!", (30, 120),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                            last_message = "Left rotation complete! "
+                            message_time = current_time
+
+
+                    elif direction in ["right", "left"]:
+                        if abs(shoulder_angle) < NEUTRAL_THRESHOLD:
+                            direction = "neutral"
+
+                    # If both sides completed in this cycle → one repetition
+                    if "left" in completed_sides and "right" in completed_sides and direction == "neutral":
+                        rep_count += 1
+                        last_message = f"L:{max_left:.1f}deg, R:{max_right:.1f}deg"
+                        message_time = current_time
+                        print(f"Repetition {rep_count} completed! Max L: {max_left:.1f}, Max R: {max_right:.1f}")
+
+                        # Display on screen
+                        cv2.putText(image, f"Rep {rep_count} done!", (30, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+
+                        # Reset for next repetition
+                        completed_sides.clear()
+                        max_left = 0.0
+                        max_right = 0.0
+
+                    # Draw persistent message if within time window
+                    if current_time - message_time < MESSAGE_DURATION:
+                        cv2.putText(image, last_message, (30, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+                        
+                        
+                    # Display counter on screen
+                    cv2.putText(image, f"Reps: {rep_count}", (30, 150),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2, cv2.LINE_AA)
+                                        
+                                        
+                                        
+                                        
                 else:
                     cv2.putText(image, "Hold still: landmarks not visible",
                                 (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
