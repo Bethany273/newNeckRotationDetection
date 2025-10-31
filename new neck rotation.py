@@ -5,7 +5,7 @@ import time
 import math
 
 # ---------- Parameters ----------
-R_AT_90 = 0.55      # Expected proportion ratio at 90 deg yaw (for reference)
+R_AT_90 = 0.6     # Expected proportion ratio at 90 deg yaw (for reference)
 VIS_THRESH = 0.5    # Visibility threshold for landmarks
 CALIB_SECONDS = 3.0 # Calibration duration in seconds
 GAMMA = 0.5         # (Unused now, kept if you want nonlinear scaling later)
@@ -20,7 +20,8 @@ calibration_ear = []
 calibration_nose_offset = []
 calibration_complete = False
 baseline_nose_offset = 0.0
-
+calibration_nose_x = []
+baseline_nose_x = 0.0
 
 # ---------- Utility Functions ----------
 def clamp(x, lo, hi):
@@ -45,8 +46,8 @@ print("Face forward for calibration. Keep shoulders visible.")
 
 # ---------- Main Loop ----------
 with mp_pose.Pose(min_detection_confidence=0.5,
-                  min_tracking_confidence=0.5,
-                  model_complexity=1) as pose:
+min_tracking_confidence=0.5,
+model_complexity=1) as pose:
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -115,6 +116,9 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                 calibration_shoulder.append(shoulder_dist)
                 calibration_ear.append(ear_dist)
                 calibration_nose_offset.append(nose_to_shoulder)
+                nose_offset_px = nose_px[0] - mid_shoulder_x
+                calibration_nose_x.append(nose_offset_px)
+
                 cv2.putText(
                     image,
                     f"Calibrating... Face forward {CALIB_SECONDS - elapsed:.1f}s",
@@ -131,8 +135,8 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                         baseline_nose_offset = float(np.mean(calibration_nose_offset))
                         calibration_complete = True
                         timer_started = False
-                        print(f"Calibration complete. Avg proportion px: {proportion_ear_shoulder:.3f}, "
-                              f"Nose offset baseline: {baseline_nose_offset:.3f}")
+                        print(f"Calibration complete. Avg proportion px: {proportion_ear_shoulder:.3f}, ")
+                        print(f"Nose offset baseline: {baseline_nose_offset:.3f}")
                     else:
                         timer_started = False
                 else:
@@ -143,21 +147,51 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                         (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
 
 
-        # ---------- Compute Head Yaw after Calibration ----------
         if calibration_complete:
-            if landmarks_ok:
-                # compute how much nose moved horizontally from baseline
-                delta_offset = nose_to_shoulder - baseline_nose_offset
+            try:
+                if calibration_nose_x:
+                    baseline_nose_x = float(np.mean(calibration_nose_x))
+                else:
+                    baseline_nose_x = 0.0
 
-                # scale to degrees (adjust factor if needed)
-                shoulder_angle = clamp(delta_offset * 180, -90, 90)
+                if landmarks_ok:
+                    delta_offset = nose_to_shoulder - baseline_nose_offset
 
-                cv2.putText(image, f"Head Rotation: {shoulder_angle:+.1f} deg",
-                            (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
-            else:
-                cv2.putText(image, "Hold still: landmarks not visible",
-                            (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                    SCALE = 2.0
+                    GAMMA = 1.8
+                    t = clamp(abs(delta_offset) * SCALE, 0.0, 1.0)
+                    t_mapped = t ** GAMMA
+                    shoulder_angle = 90.0 * t_mapped
+                    if delta_offset < 0:
+                        shoulder_angle = -shoulder_angle
 
+                    # compensate for head shift (if ears visible)
+                    if all(lm.visibility > VIS_THRESH for lm in [REAR, LEAR]):
+                        ear_asymmetry = (LEAR.x - REAR.x)
+                        correction_factor = 1.0 - 0.7 * abs(ear_asymmetry)
+                        correction_factor = clamp(correction_factor, 0.5, 1.0)
+                    else:
+                        correction_factor = 1.0
+
+                    shoulder_angle *= correction_factor
+
+                    cv2.putText(image, f"Head Rotation: {shoulder_angle:+.1f} deg",
+                                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+
+                    # compute and show translation (head shift)
+                    head_shift_px = nose_px[0] - mid_shoulder_x
+                    delta_shift = head_shift_px - baseline_nose_x
+                    head_shift_ratio = delta_shift / (shoulder_dist + EPS)
+                    real_shift_cm = head_shift_ratio * 40.0
+
+                    cv2.putText(image, f"Head Shift: {real_shift_cm:+.1f} cm",
+                                (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(image, "Hold still: landmarks not visible",
+                                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+
+            except Exception as e:
+                print("Error during post-calibration:", e)
 
         # ---------- Display Instructions ----------
         if not calibration_complete:
@@ -165,7 +199,6 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                         (30, img_h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
             cv2.putText(image, "Calibration starts automatically.",
                         (30, img_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
-
         cv2.imshow('Head-Body Rotation Estimation', image)
 
         key = cv2.waitKey(1) & 0xFF
