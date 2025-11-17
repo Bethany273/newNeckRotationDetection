@@ -9,6 +9,7 @@ R_AT_90 = 0.6     # Expected proportion ratio at 90 deg yaw (for reference)
 VIS_THRESH = 0.5    # Visibility threshold for landmarks
 CALIB_SECONDS = 3.0 # Calibration duration in seconds        # (Unused now, kept if you want nonlinear scaling later)
 EPS = 1e-6
+MAX_ROTATION_ANGLE = 80.0  # maximum rotation angle (degrees)
 
 # ---------- Globals ----------
 proportion_ear_shoulder = 0.0
@@ -42,6 +43,58 @@ def clamp(x, lo, hi):
 
 def l2(p, q):
     return math.hypot(q[0] - p[0], q[1] - p[1])
+
+
+def angle_color(angle_abs: float):
+    """Return BGR color tuple for the given absolute angle using thresholds:
+    red: <60, yellow: 60-70, green: >70
+    """
+    if angle_abs < 60.0:
+        return (0, 0, 255)
+    elif angle_abs < 70.0:
+        return (0, 255, 255)
+    else:
+        return (0, 255, 0)
+
+
+def show_report(avg_left: float, avg_right: float):
+    """Create and display a simple report screen summarizing average rotations.
+    avg_left and avg_right are absolute degrees.
+    The screen waits for a keypress or 15 seconds before closing.
+    """
+    w, h = 800, 480
+    report = np.ones((h, w, 3), dtype=np.uint8) * 240
+
+    title = "Rotation Session Report"
+    cv2.putText(report, title, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (50, 50, 50), 2, cv2.LINE_AA)
+
+    # Left
+    cv2.putText(report, f"Average Left Rotation: {avg_left:.1f} deg", (30, 130),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (50, 50, 50), 2, cv2.LINE_AA)
+    color_l = angle_color(avg_left)
+    cv2.rectangle(report, (500, 100), (740, 160), color_l, -1)
+    # Right
+    cv2.putText(report, f"Average Right Rotation: {avg_right:.1f} deg", (30, 220),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (50, 50, 50), 2, cv2.LINE_AA)
+    color_r = angle_color(avg_right)
+    cv2.rectangle(report, (500, 190), (740, 250), color_r, -1)
+
+    # Threshold legend
+    cv2.putText(report, "Legend:", (30, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (50, 50, 50), 2, cv2.LINE_AA)
+    cv2.rectangle(report, (30, 350), (80, 390), (0, 0, 255), -1)
+    cv2.putText(report, "< 60 deg (red)", (95, 365), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 50, 50), 2, cv2.LINE_AA)
+    cv2.rectangle(report, (260, 350), (310, 390), (0, 255, 255), -1)
+    cv2.putText(report, "60-70 deg (yellow)", (325, 365), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 50, 50), 2, cv2.LINE_AA)
+    cv2.rectangle(report, (520, 350), (570, 390), (0, 255, 0), -1)
+    cv2.putText(report, "> 70 deg (green)", (585, 365), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 50, 50), 2, cv2.LINE_AA)
+
+    cv2.putText(report, "Press any key to exit or wait 15s...", (30, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 80), 2, cv2.LINE_AA)
+
+    cv2.imshow('Rotation Report', report)
+    # wait for key or timeout
+    key = cv2.waitKey(15000)
+    # close report window
+    cv2.destroyWindow('Rotation Report')
 
 
 # ---------- Setup ----------
@@ -175,7 +228,7 @@ model_complexity=1) as pose:
                     t = clamp(abs(delta_offset) * SCALE, 0.0, 1.0)
                     t_mapped =1 - (1 - t)**GAMMA
                     t_mapped = t_mapped ** 1.5
-                    shoulder_angle = 90.0 * t_mapped
+                    shoulder_angle = MAX_ROTATION_ANGLE * t_mapped
                     if delta_offset < 0:
                         shoulder_angle = -shoulder_angle
 
@@ -189,8 +242,13 @@ model_complexity=1) as pose:
 
                     shoulder_angle *= correction_factor
 
+                    # Ensure we never exceed configured max rotation
+                    shoulder_angle = clamp(shoulder_angle, -MAX_ROTATION_ANGLE, MAX_ROTATION_ANGLE)
+
+                    # color the angle text per thresholds (use absolute angle)
+                    angle_col = angle_color(abs(shoulder_angle))
                     cv2.putText(image, f"Head Rotation: {shoulder_angle:+.1f} deg",
-                                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+                                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, angle_col, 2, cv2.LINE_AA)
                     
                     # Initialize globals (only first run)
                     if 'last_message' not in globals():
@@ -231,7 +289,7 @@ model_complexity=1) as pose:
                     # If both sides completed in this cycle → one repetition
                     if "left" in completed_sides and "right" in completed_sides and direction == "neutral":
                         rep_count += 1
-                        last_message = f"L:{max_left:.1f}deg, R:{max_right:.1f}deg"
+                        last_message = f"L:{abs(max_left):.1f}deg, R:{abs(max_right):.1f}deg"
                         message_time = current_time
                         print(f"Repetition {rep_count} completed! Max L: {max_left:.1f}, Max R: {max_right:.1f}")
                         rep_max_left.append(max_left)
@@ -247,22 +305,21 @@ model_complexity=1) as pose:
                         max_right = 0.0
                         
                         if rep_count >= MAX_REPS:
-                            avg_left = sum(rep_max_left) / len(rep_max_left)
-                            avg_right = sum(rep_max_right) / len(rep_max_right)
+                            # compute absolute average rotations for reporting
+                            avg_left = abs(sum(rep_max_left) / len(rep_max_left))
+                            avg_right = abs(sum(rep_max_right) / len(rep_max_right))
 
                             print("\n==== SESSION COMPLETE ====")
                             print(f"Average Left Rotation:  {avg_left:.1f}°")
                             print(f"Average Right Rotation: {avg_right:.1f}°")
                             print("==========================")
 
-                            # Display on-screen before closing
-                            cv2.putText(image, f"Avg L: {avg_left:.1f} deg", (30, 220),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-                            cv2.putText(image, f"Avg R: {avg_right:.1f} deg", (30, 260),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                            # show dedicated report screen (waits for key or timeout)
+                            try:
+                                show_report(avg_left, avg_right)
+                            except Exception as e:
+                                print("Failed to show report screen:", e)
 
-                            cv2.imshow('Head-Body Rotation Estimation', image)
-                            cv2.waitKey(10000)   # show results for 10 seconds
                             break  # exit main loop
 
                     # Draw persistent message if within time window
