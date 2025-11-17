@@ -21,6 +21,9 @@ calibration_complete = False
 baseline_nose_offset = 0.0
 calibration_nose_x = []
 baseline_nose_x = 0.0
+rep_max_left = []
+rep_max_right = []
+MAX_REPS = 5
 
 # ---------- Repetition & Max Rotation Logic ----------
 
@@ -231,7 +234,9 @@ model_complexity=1) as pose:
                         last_message = f"L:{max_left:.1f}deg, R:{max_right:.1f}deg"
                         message_time = current_time
                         print(f"Repetition {rep_count} completed! Max L: {max_left:.1f}, Max R: {max_right:.1f}")
-
+                        rep_max_left.append(max_left)
+                        rep_max_right.append(max_right)
+                        
                         # Display on screen
                         cv2.putText(image, f"Rep {rep_count} done!", (30, 120),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
@@ -240,6 +245,25 @@ model_complexity=1) as pose:
                         completed_sides.clear()
                         max_left = 0.0
                         max_right = 0.0
+                        
+                        if rep_count >= MAX_REPS:
+                            avg_left = sum(rep_max_left) / len(rep_max_left)
+                            avg_right = sum(rep_max_right) / len(rep_max_right)
+
+                            print("\n==== SESSION COMPLETE ====")
+                            print(f"Average Left Rotation:  {avg_left:.1f}°")
+                            print(f"Average Right Rotation: {avg_right:.1f}°")
+                            print("==========================")
+
+                            # Display on-screen before closing
+                            cv2.putText(image, f"Avg L: {avg_left:.1f} deg", (30, 220),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                            cv2.putText(image, f"Avg R: {avg_right:.1f} deg", (30, 260),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+
+                            cv2.imshow('Head-Body Rotation Estimation', image)
+                            cv2.waitKey(10000)   # show results for 10 seconds
+                            break  # exit main loop
 
                     # Draw persistent message if within time window
                     if current_time - message_time < MESSAGE_DURATION:
@@ -250,6 +274,7 @@ model_complexity=1) as pose:
                     # Display counter on screen
                     cv2.putText(image, f"Reps: {rep_count}", (30, 150),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2, cv2.LINE_AA)
+                    
                                         
                                         
                                         
