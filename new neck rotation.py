@@ -3,6 +3,7 @@ import mediapipe as mp
 import numpy as np
 import time
 import math
+from collections import deque
 
 # ---------- Parameters ----------
 R_AT_90 = 0.6     # Expected proportion ratio at 90 deg yaw (for reference)
@@ -10,6 +11,11 @@ VIS_THRESH = 0.5    # Visibility threshold for landmarks
 CALIB_SECONDS = 3.0 # Calibration duration in seconds        # (Unused now, kept if you want nonlinear scaling later)
 EPS = 1e-6
 MAX_ROTATION_ANGLE = 80.0  # maximum rotation angle (degrees)
+SHOULDER_SIGN_INVERT = 1  # can be flipped to -1 if detected shoulder sign is reversed
+SENSITIVITY = 7.0  # multiplier to make reported rotation more sensitive (raised further for head)
+SHOULDER_GAIN = 7.0  # multiplier to increase shoulder contribution when compensating (increased further)
+SHOULDER_SIGN_HISTORY_LEN = 9  # number of frames to stabilize shoulder sign detection
+SHOULDER_SMOOTH_ALPHA = 0.35  # exponential smoothing for shoulder delta (moderate smoothing for stability)
 
 # ---------- Globals ----------
 proportion_ear_shoulder = 0.0
@@ -25,6 +31,22 @@ baseline_nose_x = 0.0
 rep_max_left = []
 rep_max_right = []
 MAX_REPS = 5
+calibration_mid_shoulder = []
+baseline_mid_shoulder = 0.0
+baseline_shoulder_dist = 0.0
+calibration_shoulder_xdiff = []
+baseline_shoulder_xdiff = 0.0
+# not using torso hip landmarks; shoulder-only compensation
+# no smoothing; use instantaneous angles for head and shoulders
+calibration_head_angles = []
+calibration_hip_angles = []  # collect hip angles to establish body baseline
+calibration_shoulder_angles = []
+baseline_head_angle = 0.0
+baseline_hip_angle = 0.0  # body orientation baseline
+baseline_shoulder_angle = 0.0
+# ring buffer to smooth the detected shoulder rotation direction
+sh_sign_history = deque(maxlen=SHOULDER_SIGN_HISTORY_LEN)
+prev_sh_delta_smoothed = 0.0
 
 # ---------- Repetition & Max Rotation Logic ----------
 
@@ -144,10 +166,13 @@ model_complexity=1) as pose:
                 LEAR = landmarks[mp_pose.PoseLandmark.LEFT_EAR.value]
                 REAR = landmarks[mp_pose.PoseLandmark.RIGHT_EAR.value]
                 NOSE = landmarks[mp_pose.PoseLandmark.NOSE.value]
+                LHI = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
+                RHI = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
 
                 visible = (
                     LSH.visibility > VIS_THRESH and RSH.visibility > VIS_THRESH and
-                    LEAR.visibility > VIS_THRESH and REAR.visibility > VIS_THRESH
+                    LEAR.visibility > VIS_THRESH and REAR.visibility > VIS_THRESH and
+                    LHI.visibility > VIS_THRESH and RHI.visibility > VIS_THRESH
                 )
 
                 if visible:
@@ -156,11 +181,21 @@ model_complexity=1) as pose:
                     lear_px = (LEAR.x * img_w, LEAR.y * img_h)
                     rear_px = (REAR.x * img_w, REAR.y * img_h)
                     nose_px = (NOSE.x * img_w, NOSE.y * img_h)
+                    lhi_px = (LHI.x * img_w, LHI.y * img_h)
+                    rhi_px = (RHI.x * img_w, RHI.y * img_h)
 
                     mid_shoulder_x = (lsh_px[0] + rsh_px[0]) / 2.0
+                    mid_shoulder_y = (lsh_px[1] + rsh_px[1]) / 2.0
+                    mid_hip_x = (lhi_px[0] + rhi_px[0]) / 2.0
+                    mid_hip_y = (lhi_px[1] + rhi_px[1]) / 2.0
+                    mid_shoulder_y = (lsh_px[1] + rsh_px[1]) / 2.0
+                    # (shoulder asymmetry not needed; we'll use midpoint movement)
                     ear_dist = l2(lear_px, rear_px)
                     shoulder_dist = l2(lsh_px, rsh_px)
                     nose_to_shoulder = (nose_px[0] - mid_shoulder_x) / (shoulder_dist + EPS)
+                    # nose_to_shoulder still used for head mapping; no torso used here
+                    # store shoulder x-diff for potential sign autodetect (r.x - l.x)
+                    shoulder_xdiff = (rsh_px[0] - lsh_px[0])
                     landmarks_ok = True
 
             except Exception as e:
@@ -182,8 +217,27 @@ model_complexity=1) as pose:
                 calibration_shoulder.append(shoulder_dist)
                 calibration_ear.append(ear_dist)
                 calibration_nose_offset.append(nose_to_shoulder)
+                # capture shoulder x-difference for sign autodetection
+                calibration_shoulder_xdiff.append(shoulder_xdiff)
                 nose_offset_px = nose_px[0] - mid_shoulder_x
                 calibration_nose_x.append(nose_offset_px)
+                calibration_mid_shoulder.append(mid_shoulder_x)
+                # collect angular baselines: head vector and shoulder vector
+                head_vec_y = nose_px[1] - mid_shoulder_y
+                head_vec_x = nose_px[0] - mid_shoulder_x
+                head_ang = math.atan2(head_vec_y, head_vec_x)
+                calibration_head_angles.append(head_ang)
+
+                # collect hip angle (body orientation baseline)
+                hip_vec_y = rhi_px[1] - lhi_px[1]
+                hip_vec_x = rhi_px[0] - lhi_px[0]
+                hip_ang = math.atan2(hip_vec_y, hip_vec_x)
+                calibration_hip_angles.append(hip_ang)
+
+                sh_vec_y = rsh_px[1] - lsh_px[1]
+                sh_vec_x = rsh_px[0] - lsh_px[0]
+                sh_ang = math.atan2(sh_vec_y, sh_vec_x)
+                calibration_shoulder_angles.append(sh_ang)
 
                 cv2.putText(
                     image,
@@ -199,6 +253,30 @@ model_complexity=1) as pose:
                     if valid_props:
                         proportion_ear_shoulder = float(np.mean(valid_props))
                         baseline_nose_offset = float(np.mean(calibration_nose_offset))
+                        if calibration_mid_shoulder:
+                            baseline_mid_shoulder = float(np.mean(calibration_mid_shoulder))
+                        if calibration_shoulder:
+                            baseline_shoulder_dist = float(np.mean(calibration_shoulder))
+                        if calibration_shoulder_xdiff:
+                            baseline_shoulder_xdiff = float(np.mean(calibration_shoulder_xdiff))
+                            # if the average x-diff is negative, landmark left/right are flipped -> invert shoulder sign
+                            if baseline_shoulder_xdiff < 0.0:
+                                SHOULDER_SIGN_INVERT = -1
+                                print("Auto-inverted shoulder sign based on calibration x-diff")
+
+                        # compute circular mean of collected angles
+                        if calibration_head_angles:
+                            sin_sum = float(np.mean([math.sin(a) for a in calibration_head_angles]))
+                            cos_sum = float(np.mean([math.cos(a) for a in calibration_head_angles]))
+                            baseline_head_angle = math.atan2(sin_sum, cos_sum)
+                        if calibration_hip_angles:
+                            sin_sum = float(np.mean([math.sin(a) for a in calibration_hip_angles]))
+                            cos_sum = float(np.mean([math.cos(a) for a in calibration_hip_angles]))
+                            baseline_hip_angle = math.atan2(sin_sum, cos_sum)
+                        if calibration_shoulder_angles:
+                            sin_sum = float(np.mean([math.sin(a) for a in calibration_shoulder_angles]))
+                            cos_sum = float(np.mean([math.cos(a) for a in calibration_shoulder_angles]))
+                            baseline_shoulder_angle = math.atan2(sin_sum, cos_sum)
                         calibration_complete = True
                         timer_started = False
                         print(f"Calibration complete. Avg proportion px: {proportion_ear_shoulder:.3f}, ")
@@ -215,40 +293,109 @@ model_complexity=1) as pose:
 
         if calibration_complete:
             try:
-                if calibration_nose_x:
-                    baseline_nose_x = float(np.mean(calibration_nose_x))
-                else:
-                    baseline_nose_x = 0.0
-
+                # baseline_nose_x unused; use normalized nose_to_shoulder baseline instead
                 if landmarks_ok:
-                    delta_offset = nose_to_shoulder - baseline_nose_offset
+                    # head offset: normalized nose-to-shoulder difference from calibration baseline
+                    head_offset = 0.0
+                    if baseline_shoulder_dist and (baseline_nose_offset is not None):
+                        head_offset = (nose_to_shoulder - baseline_nose_offset)
 
-                    SCALE = 1.5
-                    GAMMA = 1.8
-                    t = clamp(abs(delta_offset) * SCALE, 0.0, 1.0)
-                    t_mapped =1 - (1 - t)**GAMMA
-                    t_mapped = t_mapped ** 1.5
-                    shoulder_angle = MAX_ROTATION_ANGLE * t_mapped
-                    if delta_offset < 0:
-                        shoulder_angle = -shoulder_angle
+                    # shoulder offset: midpoint movement relative to baseline (camera frame) normalized by shoulder width
+                    shoulder_offset = 0.0
+                    if baseline_mid_shoulder and baseline_shoulder_dist:
+                        shoulder_offset = (mid_shoulder_x - baseline_mid_shoulder) / (baseline_shoulder_dist + EPS)
 
-                    # compensate for head shift (if ears visible)
-                    if all(lm.visibility > VIS_THRESH for lm in [REAR, LEAR]):
-                        ear_asymmetry = (LEAR.x - REAR.x)
-                        correction_factor = 1.0 - 0.7 * abs(ear_asymmetry)
-                        correction_factor = clamp(correction_factor, 0.5, 1.0)
-                    else:
-                        correction_factor = 1.0
+                    # geometric mapping: use arctan of normalized offset to produce an angle
+                    # atan is smoother and maps 0..inf to 0..pi/2; we scale by ANGLE_K
+                    ANGLE_K = 3.5
+                    def map_offset_to_angle(off):
+                        # off is normalized by shoulder width; clamp small values
+                        val = math.atan(ANGLE_K * off)
+                        # normalize to [0, pi/2] then map to 0..MAX_ROTATION_ANGLE
+                        angle = (val / (math.pi / 2.0)) * MAX_ROTATION_ANGLE
+                        return angle
 
-                    shoulder_angle *= correction_factor
+                    # compute absolute angular orientation of head and hips (in degrees)
+                    head_vec_x = nose_px[0] - mid_shoulder_x
+                    head_vec_y = nose_px[1] - mid_shoulder_y
+                    head_ang_deg = math.degrees(math.atan2(head_vec_y, head_vec_x))
+
+                    hip_vec_x = rhi_px[0] - lhi_px[0]
+                    hip_vec_y = rhi_px[1] - lhi_px[1]
+                    hip_ang_deg = math.degrees(math.atan2(hip_vec_y, hip_vec_x))
+
+                    base_head_deg = math.degrees(baseline_head_angle) if baseline_head_angle else 0.0
+                    base_hip_deg = math.degrees(baseline_hip_angle) if baseline_hip_angle else 0.0
+
+                    def angle_diff(a, b):
+                        d = (a - b + 180.0) % 360.0 - 180.0
+                        return d
+
+                    head_delta = angle_diff(head_ang_deg, base_head_deg)
+                    hip_delta = angle_diff(hip_ang_deg, base_hip_deg)
+                    
+                    # compute shoulder rotation using two metrics:
+                    # 1. x-diff change (right_x - left_x): when rotating clockwise (right), x-diff decreases (shoulders compress)
+                    #    when rotating anticlockwise (left), x-diff increases (shoulders expand)
+                    # Note: camera is mirrored, so we invert the x-diff sign to match user perception
+                    current_sh_xdiff = rsh_px[0] - lsh_px[0]
+                    # invert sign: positive (expanding) from camera = anticlockwise from user perspective (negative)
+                    sh_xdiff_delta = -(current_sh_xdiff - baseline_shoulder_xdiff)
+                    
+                    # shoulder distance change: negative when distance decreases (rotating)
+                    sh_dist_delta = (shoulder_dist - baseline_shoulder_dist) / (baseline_shoulder_dist + EPS)
+                    
+                    # combine both metrics: x-diff gives direction, distance change amplifies rotation magnitude
+                    SH_XDIFF_GAIN = 0.8  # gain for x-diff contribution (reduced further for less sensitivity)
+                    SH_DIST_GAIN = 0.4  # gain for distance-change contribution (reduced further to dampen shoulder)
+                    
+                    # base angle from x-diff (gives direction)
+                    sh_ang_from_xdiff = sh_xdiff_delta * SH_XDIFF_GAIN
+                    
+                    # distance-based amplification: abs(distance_delta) amplifies the x-diff sign
+                    # when shoulders rotate inward (distance decreases), abs(sh_dist_delta) is positive and amplifies
+                    dist_amplify = max(1.0, 1.0 + abs(sh_dist_delta) * SH_DIST_GAIN)
+                    
+                    sh_ang_deg = sh_ang_from_xdiff * dist_amplify
+                    
+                    # shoulder rotation relative to body (hip): subtract hip rotation from shoulder rotation
+                    # this removes body/torso rotation, isolating pure shoulder rotation within the body frame
+                    sh_delta = sh_ang_deg - hip_delta
+
+                    # adjust shoulder contribution based on ear vs expected ear distance
+                    shoulder_adjust = 0.0
+                    try:
+                        if proportion_ear_shoulder and shoulder_dist and ear_dist:
+                            expected_ear = proportion_ear_shoulder * shoulder_dist
+                            ratio_diff = (ear_dist - expected_ear) / (expected_ear + EPS)
+                            ADJUST_GAIN = 3.5
+                            MAX_ADJ = 8.0
+                            shoulder_adjust = clamp(ratio_diff * ADJUST_GAIN, -MAX_ADJ, MAX_ADJ)
+                    except Exception:
+                        shoulder_adjust = 0.0
+
+                    # apply a small exponential smoothing to shoulder delta to reduce sign noise
+                    sh_delta_smoothed = (SHOULDER_SMOOTH_ALPHA * sh_delta) + ((1.0 - SHOULDER_SMOOTH_ALPHA) * prev_sh_delta_smoothed)
+                    prev_sh_delta_smoothed = sh_delta_smoothed
+
+                    # simple direct calculation: neck rotation = head rotation - shoulder rotation
+                    # this naturally compensates for body rotation
+                    neck_angle = head_delta - sh_delta_smoothed
+
+                    # apply sensitivity multiplier
+                    neck_angle = neck_angle * SENSITIVITY
 
                     # Ensure we never exceed configured max rotation
-                    shoulder_angle = clamp(shoulder_angle, -MAX_ROTATION_ANGLE, MAX_ROTATION_ANGLE)
+                    neck_angle = clamp(neck_angle, -MAX_ROTATION_ANGLE, MAX_ROTATION_ANGLE)
 
-                    # color the angle text per thresholds (use absolute angle)
-                    angle_col = angle_color(abs(shoulder_angle))
-                    cv2.putText(image, f"Head Rotation: {shoulder_angle:+.1f} deg",
-                                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, angle_col, 2, cv2.LINE_AA)
+                    # color the angle text per thresholds (use absolute neck angle)
+                    # NOTE: head/neck rotation display/commented out per user request
+                    # angle_col = angle_color(abs(neck_angle))
+                    # cv2.putText(image, f"Head Rotation: {neck_angle:+.1f} deg",
+                    #             (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, angle_col, 2, cv2.LINE_AA)
+                    # show head and shoulder delta values
+                    cv2.putText(image, f"Head Δ: {head_delta:+.1f}°", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2, cv2.LINE_AA)
+                    cv2.putText(image, f"Shoulder Δ: {sh_delta_smoothed:+.1f}°", (30, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2, cv2.LINE_AA)
                     
                     # Initialize globals (only first run)
                     if 'last_message' not in globals():
@@ -257,15 +404,15 @@ model_complexity=1) as pose:
 
                     current_time = time.time()
                     
-                    # Record max angles reached
-                    if shoulder_angle > max_right:
-                        max_right = shoulder_angle
-                    if shoulder_angle < max_left:
-                        max_left = shoulder_angle
+                    # Record max neck angles reached
+                    if neck_angle > max_right:
+                        max_right = neck_angle
+                    if neck_angle < max_left:
+                        max_left = neck_angle
 
                     # State transitions
                     if direction == "neutral":
-                        if shoulder_angle > ANGLE_THRESHOLD:
+                        if neck_angle > ANGLE_THRESHOLD:
                             direction = "right"
                             completed_sides.add("right")
                             cv2.putText(image, "Right rotation complete!", (30, 120),
@@ -273,7 +420,7 @@ model_complexity=1) as pose:
                             last_message = "Right rotation complete!"
                             message_time = current_time
 
-                        elif shoulder_angle < -ANGLE_THRESHOLD:
+                        elif neck_angle < -ANGLE_THRESHOLD:
                             direction = "left"
                             completed_sides.add("left")
                             cv2.putText(image, "Left rotation complete!", (30, 120),
@@ -283,7 +430,7 @@ model_complexity=1) as pose:
 
 
                     elif direction in ["right", "left"]:
-                        if abs(shoulder_angle) < NEUTRAL_THRESHOLD:
+                        if abs(neck_angle) < NEUTRAL_THRESHOLD:
                             direction = "neutral"
 
                     # If both sides completed in this cycle → one repetition
