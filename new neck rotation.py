@@ -14,6 +14,7 @@ MAX_ROTATION_ANGLE = 80.0  # maximum rotation angle (degrees)
 SHOULDER_SIGN_INVERT = 1  # can be flipped to -1 if detected shoulder sign is reversed
 SENSITIVITY = 7.0  # multiplier to make reported rotation more sensitive (raised further for head)
 SHOULDER_GAIN = 7.0  # multiplier to increase shoulder contribution when compensating (increased further)
+DEBUG_MODE = False  # Set to True to display detailed shoulder direction diagnostics
 SHOULDER_SIGN_HISTORY_LEN = 9  # number of frames to stabilize shoulder sign detection
 SHOULDER_SMOOTH_ALPHA = 0.35  # exponential smoothing for shoulder delta (moderate smoothing for stability)
 
@@ -47,6 +48,7 @@ baseline_shoulder_angle = 0.0
 # ring buffer to smooth the detected shoulder rotation direction
 sh_sign_history = deque(maxlen=SHOULDER_SIGN_HISTORY_LEN)
 prev_sh_delta_smoothed = 0.0
+mid_shoulder_direction = "CENTER"
 
 # ---------- Repetition & Max Rotation Logic ----------
 
@@ -189,6 +191,24 @@ model_complexity=1) as pose:
                     mid_hip_x = (lhi_px[0] + rhi_px[0]) / 2.0
                     mid_hip_y = (lhi_px[1] + rhi_px[1]) / 2.0
                     mid_shoulder_y = (lsh_px[1] + rsh_px[1]) / 2.0
+                    # Draw midpoints for shoulder and hip and determine simple direction by x-offset
+                    MID_DIR_THRESHOLD_PX = 8  # pixels tolerance to avoid jitter
+                    mid_sh_pt = (int(mid_shoulder_x), int(mid_shoulder_y))
+                    mid_hip_pt = (int(mid_hip_x), int(mid_hip_y))
+                    # draw points and connecting line
+                    cv2.circle(image, mid_sh_pt, 6, (0, 255, 0), -1)  # mid-shoulder (green)
+                    cv2.circle(image, mid_hip_pt, 6, (255, 0, 0), -1)  # mid-hip (blue)
+                    cv2.line(image, mid_sh_pt, mid_hip_pt, (200, 200, 200), 1)
+                    # determine simple mid-based shoulder direction
+                    dx_mid = mid_shoulder_x - mid_hip_x
+                    if dx_mid < -MID_DIR_THRESHOLD_PX:
+                        mid_shoulder_direction = "LEFT"
+                    elif dx_mid > MID_DIR_THRESHOLD_PX:
+                        mid_shoulder_direction = "RIGHT"
+                    else:
+                        mid_shoulder_direction = "CENTER"
+                    # show on screen
+                    cv2.putText(image, f"MidDir: {mid_shoulder_direction}", (int(mid_shoulder_x)+10, int(mid_shoulder_y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
                     # (shoulder asymmetry not needed; we'll use midpoint movement)
                     ear_dist = l2(lear_px, rear_px)
                     shoulder_dist = l2(lsh_px, rsh_px)
@@ -361,6 +381,20 @@ model_complexity=1) as pose:
                     # shoulder rotation relative to body (hip): subtract hip rotation from shoulder rotation
                     # this removes body/torso rotation, isolating pure shoulder rotation within the body frame
                     sh_delta = sh_ang_deg - hip_delta
+                    
+                    # DEBUG: Print shoulder direction diagnostics if DEBUG_MODE enabled
+                    if DEBUG_MODE:
+                        print(f"\n--- Shoulder Direction Debug ---")
+                        print(f"Right Shoulder X: {rsh_px[0]:.1f}, Left Shoulder X: {lsh_px[0]:.1f}")
+                        print(f"Current x-diff (R-L): {current_sh_xdiff:.1f}")
+                        print(f"Baseline x-diff: {baseline_shoulder_xdiff:.1f}")
+                        print(f"X-diff delta (-(curr-base)): {sh_xdiff_delta:.1f}")
+                        print(f"Shoulder x-diff angle (with gain): {sh_ang_from_xdiff:.1f}°")
+                        print(f"Distance delta: {sh_dist_delta:.3f}, Amplify: {dist_amplify:.3f}")
+                        print(f"Shoulder angle (before hip subtract): {sh_ang_deg:.1f}°")
+                        print(f"Hip angle delta: {hip_delta:.1f}°")
+                        print(f"Shoulder delta (after hip subtract): {sh_delta:.1f}°")
+                        print(f"Sign interpretation: {'RIGHT' if sh_delta > 0 else 'LEFT' if sh_delta < 0 else 'CENTER'}")
 
                     # adjust shoulder contribution based on ear vs expected ear distance
                     shoulder_adjust = 0.0
@@ -377,6 +411,17 @@ model_complexity=1) as pose:
                     # apply a small exponential smoothing to shoulder delta to reduce sign noise
                     sh_delta_smoothed = (SHOULDER_SMOOTH_ALPHA * sh_delta) + ((1.0 - SHOULDER_SMOOTH_ALPHA) * prev_sh_delta_smoothed)
                     prev_sh_delta_smoothed = sh_delta_smoothed
+
+                    # Ensure shoulder sign matches midpoint-based direction (mid_shoulder_direction)
+                    # If mid-shoulder suggests RIGHT but computed shoulder delta is negative, flip sign, and vice versa.
+                    try:
+                        if mid_shoulder_direction == "RIGHT" and sh_delta_smoothed < 0.0:
+                            sh_delta_smoothed = -sh_delta_smoothed
+                        elif mid_shoulder_direction == "LEFT" and sh_delta_smoothed > 0.0:
+                            sh_delta_smoothed = -sh_delta_smoothed
+                    except Exception:
+                        # if mid_shoulder_direction is not defined or other error, ignore
+                        pass
 
                     # simple direct calculation: neck rotation = head rotation - shoulder rotation
                     # this naturally compensates for body rotation
@@ -397,6 +442,18 @@ model_complexity=1) as pose:
                     cv2.putText(image, f"Head Δ: {head_delta:+.1f}°", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2, cv2.LINE_AA)
                     cv2.putText(image, f"Shoulder Δ: {sh_delta_smoothed:+.1f}°", (30, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2, cv2.LINE_AA)
                     
+                    # DEBUG: Display shoulder direction details on screen if enabled
+                    if DEBUG_MODE:
+                        y_offset = 145
+                        cv2.putText(image, f"X-diff: {current_sh_xdiff:.1f} (base: {baseline_shoulder_xdiff:.1f})", 
+                                    (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 255), 1, cv2.LINE_AA)
+                        cv2.putText(image, f"Sh Δ (raw): {sh_ang_deg:.1f}°, Hip Δ: {hip_delta:.1f}°", 
+                                    (30, y_offset + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 255), 1, cv2.LINE_AA)
+                        direction_str = "RIGHT→" if sh_delta > 2 else "←LEFT" if sh_delta < -2 else "CENTER"
+                        cv2.putText(image, f"Direction: {direction_str}", 
+                                    (30, y_offset + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 100), 2, cv2.LINE_AA)
+                    
+
                     # Initialize globals (only first run)
                     if 'last_message' not in globals():
                         last_message = ""
