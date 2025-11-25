@@ -5,19 +5,22 @@ import time
 import math
 from collections import deque
 
+
 # ---------- Parameters ----------
 R_AT_90 = 0.6     # Expected proportion ratio at 90 deg yaw (for reference)
 VIS_THRESH = 0.5    # Visibility threshold for landmarks
-CALIB_SECONDS = 3.0 # Calibration duration in seconds        # (Unused now, kept if you want nonlinear scaling later)
+CALIB_SECONDS = 3.0 # Calibration duration in seconds    # (Unused now, kept if you want nonlinear scaling later)
 EPS = 1e-6
 MAX_ROTATION_ANGLE = 80.0  # maximum rotation angle (degrees)
 SHOULDER_SIGN_INVERT = 1  # can be flipped to -1 if detected shoulder sign is reversed
 
-SHOULDER_GAIN = 1 
-HEADSENSITIVITY = 1.6# multiplier to increase shoulder contribution when compensating (increased further)
+
+SHOULDER_GAIN = 1.2
+HEADSENSITIVITY = 2.3  # multiplier to increase shoulder contribution when compensating (increased further)
 DEBUG_MODE = False  # Set to True to display detailed shoulder direction diagnostics
 SHOULDER_SIGN_HISTORY_LEN = 9  # number of frames to stabilize shoulder sign detection
 SHOULDER_SMOOTH_ALPHA = 0.35  # exponential smoothing for shoulder delta (moderate smoothing for stability)
+
 
 # ---------- Globals ----------
 proportion_ear_shoulder = 0.0
@@ -51,7 +54,9 @@ sh_sign_history = deque(maxlen=SHOULDER_SIGN_HISTORY_LEN)
 prev_sh_delta_smoothed = 0.0
 mid_shoulder_direction = "CENTER"
 
+
 # ---------- Repetition & Max Rotation Logic ----------
+
 
 ANGLE_THRESHOLD = 30      # degrees to qualify as full turn
 NEUTRAL_THRESHOLD = 10    # degrees considered neutral range
@@ -62,12 +67,15 @@ max_left = 0.0
 completed_sides = set()
 MESSAGE_DURATION = 2.0
 
+
 # ---------- Utility Functions ----------
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
+
 def l2(p, q):
     return math.hypot(q[0] - p[0], q[1] - p[1])
+
 
 
 def angle_color(angle_abs: float):
@@ -82,6 +90,7 @@ def angle_color(angle_abs: float):
         return (0, 255, 0)
 
 
+
 def show_report(avg_left: float, avg_right: float):
     """Create and display a simple report screen summarizing average rotations.
     avg_left and avg_right are absolute degrees.
@@ -90,8 +99,10 @@ def show_report(avg_left: float, avg_right: float):
     w, h = 800, 480
     report = np.ones((h, w, 3), dtype=np.uint8) * 240
 
+
     title = "Rotation Session Report"
     cv2.putText(report, title, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (50, 50, 50), 2, cv2.LINE_AA)
+
 
     # Left
     cv2.putText(report, f"Average Left Rotation: {avg_left:.1f} deg", (30, 130),
@@ -104,6 +115,7 @@ def show_report(avg_left: float, avg_right: float):
     color_r = angle_color(avg_right)
     cv2.rectangle(report, (500, 190), (740, 250), color_r, -1)
 
+
     # Threshold legend
     cv2.putText(report, "Legend:", (30, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (50, 50, 50), 2, cv2.LINE_AA)
     cv2.rectangle(report, (30, 350), (80, 390), (0, 0, 255), -1)
@@ -113,7 +125,9 @@ def show_report(avg_left: float, avg_right: float):
     cv2.rectangle(report, (520, 350), (570, 390), (0, 255, 0), -1)
     cv2.putText(report, "> 70 deg (green)", (585, 365), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 50, 50), 2, cv2.LINE_AA)
 
+
     cv2.putText(report, "Press any key to exit or wait 15s...", (30, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 80), 2, cv2.LINE_AA)
+
 
     cv2.imshow('Rotation Report', report)
     # wait for key or timeout
@@ -122,28 +136,41 @@ def show_report(avg_left: float, avg_right: float):
     cv2.destroyWindow('Rotation Report')
 
 
+
 # ---------- Setup ----------
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
+
 
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     print("Error: Could not open camera")
     raise SystemExit
 
+
 print("Camera opened successfully. Press 'q' to quit.")
 print("Face forward for calibration. Keep shoulders visible.")
 
 
+# Initialize variables outside main loop
+last_message = ""
+message_time = 0.0
+prev_sh_zdiff = 0.0
+prev_sh_delta_smoothed = 0.0
+max_left = 0.0
+max_right = 0.0
+
+
 # ---------- Main Loop ----------
 with mp_pose.Pose(min_detection_confidence=0.5,
-min_tracking_confidence=0.5,
-model_complexity=1) as pose: 
+                min_tracking_confidence=0.5,
+                model_complexity=1) as pose:
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Failed to read frame.")
             break
+
 
         frame = cv2.flip(frame, 1)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -153,13 +180,16 @@ model_complexity=1) as pose:
         image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         img_h, img_w = image.shape[:2]
 
+
         if results.pose_landmarks:
             mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
 
         shoulder_dist = None
         ear_dist = None
         landmarks_ok = False
         nose_to_shoulder = 0.0
+
 
         if results.pose_landmarks:
             try:
@@ -172,11 +202,13 @@ model_complexity=1) as pose:
                 LHI = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
                 RHI = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
 
+
                 visible = (
                     LSH.visibility > VIS_THRESH and RSH.visibility > VIS_THRESH and
                     LEAR.visibility > VIS_THRESH and REAR.visibility > VIS_THRESH and
                     LHI.visibility > VIS_THRESH and RHI.visibility > VIS_THRESH
                 )
+
 
                 if visible:
                     lsh_px = (LSH.x * img_w, LSH.y * img_h)
@@ -187,11 +219,11 @@ model_complexity=1) as pose:
                     lhi_px = (LHI.x * img_w, LHI.y * img_h)
                     rhi_px = (RHI.x * img_w, RHI.y * img_h)
 
+
                     mid_shoulder_x = (lsh_px[0] + rsh_px[0]) / 2.0
                     mid_shoulder_y = (lsh_px[1] + rsh_px[1]) / 2.0
                     mid_hip_x = (lhi_px[0] + rhi_px[0]) / 2.0
                     mid_hip_y = (lhi_px[1] + rhi_px[1]) / 2.0
-                    mid_shoulder_y = (lsh_px[1] + rsh_px[1]) / 2.0
                     # Draw midpoints for shoulder and hip and determine simple direction by x-offset
                     MID_DIR_THRESHOLD_PX = 8  # pixels tolerance to avoid jitter
                     mid_sh_pt = (int(mid_shoulder_x), int(mid_shoulder_y))
@@ -202,6 +234,7 @@ model_complexity=1) as pose:
                     cv2.line(image, mid_sh_pt, mid_hip_pt, (200, 200, 200), 1)
                     # determine simple mid-based shoulder direction
 
+
                     # show on screen
                     ear_dist = l2(lear_px, rear_px)
                     shoulder_dist = l2(lsh_px, rsh_px)
@@ -211,9 +244,11 @@ model_complexity=1) as pose:
                     shoulder_xdiff = (rsh_px[0] - lsh_px[0])
                     landmarks_ok = True
 
+
             except Exception as e:
                 cv2.putText(image, f"Landmark error: {e}", (30, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+
 
 
         # ---------- Calibration ----------
@@ -224,6 +259,13 @@ model_complexity=1) as pose:
                 calibration_shoulder.clear()
                 calibration_ear.clear()
                 calibration_nose_offset.clear()
+                calibration_shoulder_xdiff.clear()
+                calibration_nose_x.clear()
+                calibration_mid_shoulder.clear()
+                calibration_head_angles.clear()
+                calibration_hip_angles.clear()
+                calibration_shoulder_angles.clear()
+
 
             elapsed = time.time() - start_time
             if elapsed < CALIB_SECONDS:
@@ -241,16 +283,19 @@ model_complexity=1) as pose:
                 head_ang = math.atan2(head_vec_y, head_vec_x)
                 calibration_head_angles.append(head_ang)
 
+
                 # collect hip angle (body orientation baseline)
                 hip_vec_y = rhi_px[1] - lhi_px[1]
                 hip_vec_x = rhi_px[0] - lhi_px[0]
                 hip_ang = math.atan2(hip_vec_y, hip_vec_x)
                 calibration_hip_angles.append(hip_ang)
 
+
                 sh_vec_y = rsh_px[1] - lsh_px[1]
                 sh_vec_x = rsh_px[0] - lsh_px[0]
                 sh_ang = math.atan2(sh_vec_y, sh_vec_x)
                 calibration_shoulder_angles.append(sh_ang)
+
 
                 cv2.putText(
                     image,
@@ -277,6 +322,7 @@ model_complexity=1) as pose:
                                 SHOULDER_SIGN_INVERT = -1
                                 print("Auto-inverted shoulder sign based on calibration x-diff")
 
+
                         # compute circular mean of collected angles
                         if calibration_head_angles:
                             sin_sum = float(np.mean([math.sin(a) for a in calibration_head_angles]))
@@ -299,9 +345,11 @@ model_complexity=1) as pose:
                 else:
                     timer_started = False
 
+
         elif not landmarks_ok and not calibration_complete:
             cv2.putText(image, "Ensure face and shoulders visible for calibration",
                         (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+
 
 
         if calibration_complete:
@@ -310,15 +358,13 @@ model_complexity=1) as pose:
                 if landmarks_ok:
                     sh_zdiff = (RSH.z - LSH.z)   # positive = turning LEFT, negative = turning RIGHT
 
+
                     # Smooth it to reduce jitter
                     SH_Z_SMOOTH_ALPHA = 0.35
-                    try:
-                        prev_sh_zdiff
-                    except NameError:
-                        prev_sh_zdiff = sh_zdiff
 
                     sh_zdiff_smoothed = SH_Z_SMOOTH_ALPHA * sh_zdiff + (1 - SH_Z_SMOOTH_ALPHA) * prev_sh_zdiff
                     prev_sh_zdiff = sh_zdiff_smoothed
+
 
                     # Determine direction
                     if sh_zdiff_smoothed > 0.02:
@@ -333,10 +379,12 @@ model_complexity=1) as pose:
                     if baseline_shoulder_dist and (baseline_nose_offset is not None):
                         head_offset = (nose_to_shoulder - baseline_nose_offset)
 
+
                     # shoulder offset: midpoint movement relative to baseline (camera frame) normalized by shoulder width
                     shoulder_offset = 0.0
                     if baseline_mid_shoulder and baseline_shoulder_dist:
                         shoulder_offset = (mid_shoulder_x - baseline_mid_shoulder) / (baseline_shoulder_dist + EPS)
+
 
                     # geometric mapping: use arctan of normalized offset to produce an angle
                     # atan is smoother and maps 0..inf to 0..pi/2; we scale by ANGLE_K
@@ -348,28 +396,33 @@ model_complexity=1) as pose:
                         angle = (val / (math.pi / 2.0)) * MAX_ROTATION_ANGLE
                         return angle
 
+
                     # compute absolute angular orientation of head and hips (in degrees)
                     head_vec_x = nose_px[0] - mid_shoulder_x
                     head_vec_y = nose_px[1] - mid_shoulder_y
                     head_ang_deg = math.degrees(math.atan2(head_vec_y, head_vec_x))
 
+
                     hip_vec_x = rhi_px[0] - lhi_px[0]
                     hip_vec_y = rhi_px[1] - lhi_px[1]
                     hip_ang_deg = math.degrees(math.atan2(hip_vec_y, hip_vec_x))
 
+
                     base_head_deg = math.degrees(baseline_head_angle) if baseline_head_angle else 0.0
                     base_hip_deg = math.degrees(baseline_hip_angle) if baseline_hip_angle else 0.0
+
 
                     def angle_diff(a, b):
                         d = (a - b + 180.0) % 360.0 - 180.0
                         return d
+
 
                     head_delta = angle_diff(head_ang_deg, base_head_deg)
                     hip_delta = angle_diff(hip_ang_deg, base_hip_deg)
                     
                     # compute shoulder rotation using two metrics:
                     # 1. x-diff change (right_x - left_x): when rotating clockwise (right), x-diff decreases (shoulders compress)
-                    #    when rotating anticlockwise (left), x-diff increases (shoulders expand)
+                    #     when rotating anticlockwise (left), x-diff increases (shoulders expand)
                     # Note: camera is mirrored, so we invert the x-diff sign to match user perception
                     current_sh_xdiff = rsh_px[0] - lsh_px[0]
                     # invert sign: positive (expanding) from camera = anticlockwise from user perspective (negative)
@@ -409,6 +462,7 @@ model_complexity=1) as pose:
                         print(f"Shoulder delta (after hip subtract): {sh_delta:.1f}°")
                         print(f"Sign interpretation: {'RIGHT' if sh_delta > 0 else 'LEFT' if sh_delta < 0 else 'CENTER'}")
 
+
                     # adjust shoulder contribution based on ear vs expected ear distance
                     shoulder_adjust = 0.0
                     try:
@@ -421,9 +475,11 @@ model_complexity=1) as pose:
                     except Exception:
                         shoulder_adjust = 0.0
 
+
                     # apply a small exponential smoothing to shoulder delta to reduce sign noise
                     sh_delta_smoothed = (SHOULDER_SMOOTH_ALPHA * sh_delta) + ((1.0 - SHOULDER_SMOOTH_ALPHA) * prev_sh_delta_smoothed)
                     prev_sh_delta_smoothed = sh_delta_smoothed
+
 
                     # Ensure shoulder sign matches midpoint-based direction (mid_shoulder_direction)
                     # If mid-shoulder suggests RIGHT but computed shoulder delta is negative, flip sign, and vice versa.
@@ -435,38 +491,32 @@ model_complexity=1) as pose:
                     except Exception:
                         # if mid_shoulder_direction is not defined or other error, ignore
                         pass
-                    head_delta = head_delta* HEADSENSITIVITY
+                    head_delta = head_delta * HEADSENSITIVITY
                     sh_delta_smoothed = sh_delta_smoothed * SHOULDER_GAIN
                     # simple direct calculation: neck rotation = head rotation - shoulder rotation
                     # this naturally compensates for body rotationF
-                    neck_angle = abs(head_delta) - abs(sh_delta_smoothed) 
+                    neck_angle = head_delta - sh_delta_smoothed 
+
 
 
                     # Ensure we never exceed configured max rotation
                     neck_angle = clamp(neck_angle, -MAX_ROTATION_ANGLE, MAX_ROTATION_ANGLE)
 
+
                     # show head and shoulder delta values
-                    cv2.putText(image, f"Head Δ: {head_delta:+.1f}°", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"Shoulder Δ: {sh_delta_smoothed:+.1f}°", (30, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"Neck Rotation: {neck_angle:+.1f}°", (30, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
+                    cv2.putText(image, f"Head Δ: {head_delta:+.1f}°", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
+                    cv2.putText(image, f"Shoulder Δ: {sh_delta_smoothed:+.1f}°", (30, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
+                    cv2.putText(image, f"Neck Rotation: {neck_angle:+.1f}°", (30, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
-
-                    cv2.putText(image, f"Direction: {shoulder_dir}", 
-                                    (30, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 100), 2, cv2.LINE_AA)
-                    
-
-                    # Initialize globals (only first run)
-                    if 'last_message' not in globals():
-                        last_message = ""
-                        message_time = 0.0
 
                     current_time = time.time()
                     
                     # Record max neck angles reached
                     if neck_angle > max_right:
                         max_right = neck_angle
-                    if neck_angle < max_left:
+                    if neck_angle < max_left or max_left == 0.0:
                         max_left = neck_angle
+
 
                     # State transitions
                     if direction == "neutral":
@@ -474,22 +524,25 @@ model_complexity=1) as pose:
                             direction = "right"
                             completed_sides.add("right")
                             cv2.putText(image, "Right rotation complete!", (30, 360),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
                             last_message = "Right rotation complete!"
                             message_time = current_time
+
 
                         elif neck_angle < -ANGLE_THRESHOLD:
                             direction = "left"
                             completed_sides.add("left")
                             cv2.putText(image, "Left rotation complete!", (30, 360),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
                             last_message = "Left rotation complete! "
                             message_time = current_time
+
 
 
                     elif direction in ["right", "left"]:
                         if abs(neck_angle) < NEUTRAL_THRESHOLD:
                             direction = "neutral"
+
 
                     # If both sides completed in this cycle → one repetition
                     if "left" in completed_sides and "right" in completed_sides and direction == "neutral":
@@ -504,6 +557,7 @@ model_complexity=1) as pose:
                         cv2.putText(image, f"Rep {rep_count} done!", (30, 120),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
 
+
                         # Reset for next repetition
                         completed_sides.clear()
                         max_left = 0.0
@@ -514,10 +568,12 @@ model_complexity=1) as pose:
                             avg_left = abs(sum(rep_max_left) / len(rep_max_left))
                             avg_right = abs(sum(rep_max_right) / len(rep_max_right))
 
+
                             print("\n==== SESSION COMPLETE ====")
                             print(f"Average Left Rotation:  {avg_left:.1f}°")
                             print(f"Average Right Rotation: {avg_right:.1f}°")
                             print("==========================")
+
 
                             # show dedicated report screen (waits for key or timeout)
                             try:
@@ -525,7 +581,9 @@ model_complexity=1) as pose:
                             except Exception as e:
                                 print("Failed to show report screen:", e)
 
+
                             break  # exit main loop
+
 
                     # Draw persistent message if within time window
                     if current_time - message_time < MESSAGE_DURATION:
@@ -536,17 +594,12 @@ model_complexity=1) as pose:
                     # Display counter on screen
                     cv2.putText(image, f"Reps: {rep_count}", (30, 300),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2, cv2.LINE_AA)
-                    
-                                        
-                                        
-                                        
-                                        
-                else:
-                    cv2.putText(image, "Hold still: landmarks not visible",
-                                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
-            except Exception as e:
-                print("Error during post-calibration:", e)
+
+            except:
+                cv2.putText(image, "Hold still: landmarks not visible",
+                            (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+
 
         # ---------- Display Instructions ----------
         if not calibration_complete:
@@ -555,6 +608,7 @@ model_complexity=1) as pose:
             cv2.putText(image, "Calibration starts automatically.",
                         (30, img_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
         cv2.imshow('Head-Body Rotation Estimation', image)
+
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
