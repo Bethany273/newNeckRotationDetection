@@ -12,8 +12,9 @@ CALIB_SECONDS = 3.0 # Calibration duration in seconds        # (Unused now, kept
 EPS = 1e-6
 MAX_ROTATION_ANGLE = 80.0  # maximum rotation angle (degrees)
 SHOULDER_SIGN_INVERT = 1  # can be flipped to -1 if detected shoulder sign is reversed
-SENSITIVITY = 7.0  # multiplier to make reported rotation more sensitive (raised further for head)
-SHOULDER_GAIN = 7.0  # multiplier to increase shoulder contribution when compensating (increased further)
+
+SHOULDER_GAIN = 1 
+HEADSENSITIVITY = 1.6# multiplier to increase shoulder contribution when compensating (increased further)
 DEBUG_MODE = False  # Set to True to display detailed shoulder direction diagnostics
 SHOULDER_SIGN_HISTORY_LEN = 9  # number of frames to stabilize shoulder sign detection
 SHOULDER_SMOOTH_ALPHA = 0.35  # exponential smoothing for shoulder delta (moderate smoothing for stability)
@@ -137,7 +138,7 @@ print("Face forward for calibration. Keep shoulders visible.")
 # ---------- Main Loop ----------
 with mp_pose.Pose(min_detection_confidence=0.5,
 min_tracking_confidence=0.5,
-model_complexity=1) as pose:
+model_complexity=1) as pose: 
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -200,16 +201,8 @@ model_complexity=1) as pose:
                     cv2.circle(image, mid_hip_pt, 6, (255, 0, 0), -1)  # mid-hip (blue)
                     cv2.line(image, mid_sh_pt, mid_hip_pt, (200, 200, 200), 1)
                     # determine simple mid-based shoulder direction
-                    dx_mid = mid_shoulder_x - mid_hip_x
-                    if dx_mid < -MID_DIR_THRESHOLD_PX:
-                        mid_shoulder_direction = "LEFT"
-                    elif dx_mid > MID_DIR_THRESHOLD_PX:
-                        mid_shoulder_direction = "RIGHT"
-                    else:
-                        mid_shoulder_direction = "CENTER"
+
                     # show on screen
-                    cv2.putText(image, f"MidDir: {mid_shoulder_direction}", (int(mid_shoulder_x)+10, int(mid_shoulder_y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-                    # (shoulder asymmetry not needed; we'll use midpoint movement)
                     ear_dist = l2(lear_px, rear_px)
                     shoulder_dist = l2(lsh_px, rsh_px)
                     nose_to_shoulder = (nose_px[0] - mid_shoulder_x) / (shoulder_dist + EPS)
@@ -315,6 +308,26 @@ model_complexity=1) as pose:
             try:
                 # baseline_nose_x unused; use normalized nose_to_shoulder baseline instead
                 if landmarks_ok:
+                    sh_zdiff = (RSH.z - LSH.z)   # positive = turning LEFT, negative = turning RIGHT
+
+                    # Smooth it to reduce jitter
+                    SH_Z_SMOOTH_ALPHA = 0.35
+                    try:
+                        prev_sh_zdiff
+                    except NameError:
+                        prev_sh_zdiff = sh_zdiff
+
+                    sh_zdiff_smoothed = SH_Z_SMOOTH_ALPHA * sh_zdiff + (1 - SH_Z_SMOOTH_ALPHA) * prev_sh_zdiff
+                    prev_sh_zdiff = sh_zdiff_smoothed
+
+                    # Determine direction
+                    if sh_zdiff_smoothed > 0.02:
+                        shoulder_dir = "LEFT"
+                    elif sh_zdiff_smoothed < -0.02:
+                        shoulder_dir = "RIGHT"
+                    else:
+                        shoulder_dir = "CENTER"
+                        
                     # head offset: normalized nose-to-shoulder difference from calibration baseline
                     head_offset = 0.0
                     if baseline_shoulder_dist and (baseline_nose_offset is not None):
@@ -415,43 +428,31 @@ model_complexity=1) as pose:
                     # Ensure shoulder sign matches midpoint-based direction (mid_shoulder_direction)
                     # If mid-shoulder suggests RIGHT but computed shoulder delta is negative, flip sign, and vice versa.
                     try:
-                        if mid_shoulder_direction == "RIGHT" and sh_delta_smoothed < 0.0:
+                        if shoulder_dir == "RIGHT" and sh_delta_smoothed < 0.0:
                             sh_delta_smoothed = -sh_delta_smoothed
-                        elif mid_shoulder_direction == "LEFT" and sh_delta_smoothed > 0.0:
+                        elif shoulder_dir == "LEFT" and sh_delta_smoothed > 0.0:
                             sh_delta_smoothed = -sh_delta_smoothed
                     except Exception:
                         # if mid_shoulder_direction is not defined or other error, ignore
                         pass
-
+                    head_delta = head_delta* HEADSENSITIVITY
+                    sh_delta_smoothed = sh_delta_smoothed * SHOULDER_GAIN
                     # simple direct calculation: neck rotation = head rotation - shoulder rotation
-                    # this naturally compensates for body rotation
-                    neck_angle = head_delta - sh_delta_smoothed
+                    # this naturally compensates for body rotationF
+                    neck_angle = abs(head_delta) - abs(sh_delta_smoothed) 
 
-                    # apply sensitivity multiplier
-                    neck_angle = neck_angle * SENSITIVITY
 
                     # Ensure we never exceed configured max rotation
                     neck_angle = clamp(neck_angle, -MAX_ROTATION_ANGLE, MAX_ROTATION_ANGLE)
 
-                    # color the angle text per thresholds (use absolute neck angle)
-                    # NOTE: head/neck rotation display/commented out per user request
-                    # angle_col = angle_color(abs(neck_angle))
-                    # cv2.putText(image, f"Head Rotation: {neck_angle:+.1f} deg",
-                    #             (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, angle_col, 2, cv2.LINE_AA)
                     # show head and shoulder delta values
                     cv2.putText(image, f"Head Δ: {head_delta:+.1f}°", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2, cv2.LINE_AA)
                     cv2.putText(image, f"Shoulder Δ: {sh_delta_smoothed:+.1f}°", (30, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2, cv2.LINE_AA)
-                    
-                    # DEBUG: Display shoulder direction details on screen if enabled
-                    if DEBUG_MODE:
-                        y_offset = 145
-                        cv2.putText(image, f"X-diff: {current_sh_xdiff:.1f} (base: {baseline_shoulder_xdiff:.1f})", 
-                                    (30, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 255), 1, cv2.LINE_AA)
-                        cv2.putText(image, f"Sh Δ (raw): {sh_ang_deg:.1f}°, Hip Δ: {hip_delta:.1f}°", 
-                                    (30, y_offset + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 255), 1, cv2.LINE_AA)
-                        direction_str = "RIGHT→" if sh_delta > 2 else "←LEFT" if sh_delta < -2 else "CENTER"
-                        cv2.putText(image, f"Direction: {direction_str}", 
-                                    (30, y_offset + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 100), 2, cv2.LINE_AA)
+                    cv2.putText(image, f"Neck Rotation: {neck_angle:+.1f}°", (30, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
+
+
+                    cv2.putText(image, f"Direction: {shoulder_dir}", 
+                                    (30, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 100), 2, cv2.LINE_AA)
                     
 
                     # Initialize globals (only first run)
@@ -472,7 +473,7 @@ model_complexity=1) as pose:
                         if neck_angle > ANGLE_THRESHOLD:
                             direction = "right"
                             completed_sides.add("right")
-                            cv2.putText(image, "Right rotation complete!", (30, 120),
+                            cv2.putText(image, "Right rotation complete!", (30, 360),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
                             last_message = "Right rotation complete!"
                             message_time = current_time
@@ -480,7 +481,7 @@ model_complexity=1) as pose:
                         elif neck_angle < -ANGLE_THRESHOLD:
                             direction = "left"
                             completed_sides.add("left")
-                            cv2.putText(image, "Left rotation complete!", (30, 120),
+                            cv2.putText(image, "Left rotation complete!", (30, 360),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
                             last_message = "Left rotation complete! "
                             message_time = current_time
@@ -533,7 +534,7 @@ model_complexity=1) as pose:
                         
                         
                     # Display counter on screen
-                    cv2.putText(image, f"Reps: {rep_count}", (30, 150),
+                    cv2.putText(image, f"Reps: {rep_count}", (30, 300),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2, cv2.LINE_AA)
                     
                                         
