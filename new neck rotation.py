@@ -16,7 +16,7 @@ SHOULDER_SIGN_INVERT = 1  # can be flipped to -1 if detected shoulder sign is re
 
 
 SHOULDER_GAIN = 1.2
-HEADSENSITIVITY = 2.3  # multiplier to increase shoulder contribution when compensating (increased further)
+HEADSENSITIVITY = 1.8  # multiplier to increase shoulder contribution when compensating (increased further)
 DEBUG_MODE = False  # Set to True to display detailed shoulder direction diagnostics
 SHOULDER_SIGN_HISTORY_LEN = 9  # number of frames to stabilize shoulder sign detection
 SHOULDER_SMOOTH_ALPHA = 0.35  # exponential smoothing for shoulder delta (moderate smoothing for stability)
@@ -88,6 +88,15 @@ def angle_color(angle_abs: float):
         return (0, 255, 255)
     else:
         return (0, 255, 0)
+
+
+def compress_shoulder(x, limit=90):
+    """
+    Compress shoulder rotation so it grows fast at first
+    but slows down heavily near large angles.
+    limit controls the maximum influence shoulders can have.
+    """
+    return limit * math.tanh(x / limit)
 
 
 
@@ -475,6 +484,7 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                     except Exception:
                         shoulder_adjust = 0.0
 
+                    #sh_delta_smoothed = saturate_angle(sh_delta_smoothed, k=0.05)
 
                     # apply a small exponential smoothing to shoulder delta to reduce sign noise
                     sh_delta_smoothed = (SHOULDER_SMOOTH_ALPHA * sh_delta) + ((1.0 - SHOULDER_SMOOTH_ALPHA) * prev_sh_delta_smoothed)
@@ -492,7 +502,7 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                         # if mid_shoulder_direction is not defined or other error, ignore
                         pass
                     head_delta = head_delta * HEADSENSITIVITY
-                    sh_delta_smoothed = sh_delta_smoothed * SHOULDER_GAIN
+                    sh_delta_smoothed = compress_shoulder(sh_delta_smoothed * SHOULDER_GAIN, limit=90)
                     # simple direct calculation: neck rotation = head rotation - shoulder rotation
                     # this naturally compensates for body rotationF
                     neck_angle = head_delta - sh_delta_smoothed 
